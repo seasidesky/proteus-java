@@ -1,11 +1,13 @@
 package io.netifi.proteus;
 
+import io.micrometer.core.instrument.Tags;
 import io.netifi.proteus.rsocket.ProteusSocket;
+import io.netty.buffer.ByteBuf;
 
 interface ProteusBrokerService {
-  ProteusSocket destination(String destination, String group);
+  ProteusSocket unicast(Tags tags);
 
-  ProteusSocket group(String group);
+  ProteusSocket broadcast(Tags tags);
 
-  ProteusSocket broadcast(String group);
+  ProteusSocket shard(ByteBuf shardKey, Tags tags);
 }

@@ -1,15 +1,14 @@
 package io.netifi.proteus;
 
 import com.google.protobuf.Empty;
+import io.micrometer.core.instrument.Tags;
 import io.netifi.proteus.broker.info.Broker;
 import io.netifi.proteus.broker.info.BrokerInfoServiceClient;
 import io.netifi.proteus.broker.info.Event;
 import io.netifi.proteus.frames.BroadcastFlyweight;
-import io.netifi.proteus.frames.DestinationFlyweight;
 import io.netifi.proteus.frames.DestinationSetupFlyweight;
-import io.netifi.proteus.frames.GroupFlyweight;
-import io.netifi.proteus.presence.BrokerInfoPresenceNotifier;
-import io.netifi.proteus.presence.PresenceNotifier;
+import io.netifi.proteus.frames.ShardFlyweight;
+import io.netifi.proteus.frames.UnicastFlyweight;
 import io.netifi.proteus.rsocket.*;
 import io.netifi.proteus.rsocket.transport.WeightedClientTransportSupplier;
 import io.netty.buffer.ByteBuf;
@@ -51,20 +50,18 @@ public class DefaultProteusBrokerService implements ProteusBrokerService, Dispos
   private final List<WeightedReconnectingRSocket> members;
   private final RSocket requestHandlingRSocket;
   private final SplittableRandom rnd = new SplittableRandom();
-  private final String group;
-  private final DestinationNameFactory destinationNameFactory;
   private final boolean keepalive;
   private final long tickPeriodSeconds;
   private final long ackTimeoutSeconds;
   private final int missedAcks;
   private final long accessKey;
   private final ByteBuf accessToken;
+  private final Tags tags;
   private final Function<SocketAddress, ClientTransport> clientTransportFactory;
   private final int poolSize;
   private final double expFactor = DEFAULT_EXP_FACTOR;
   private final int inactivityFactor = DEFAULT_INACTIVITY_FACTOR;
   private final BrokerInfoServiceClient client;
-  private final PresenceNotifier presenceNotifier;
   private final MonoProcessor<Void> onClose;
   private final Tracer tracer;
   private boolean clientTransportMissed = false;
@@ -73,8 +70,6 @@ public class DefaultProteusBrokerService implements ProteusBrokerService, Dispos
   public DefaultProteusBrokerService(
       List<SocketAddress> seedAddresses,
       RequestHandlingRSocket requestHandlingRSocket,
-      String group,
-      DestinationNameFactory destinationNameFactory,
       Function<SocketAddress, ClientTransport> clientTransportFactory,
       int poolSize,
       boolean keepalive,
@@ -83,6 +78,7 @@ public class DefaultProteusBrokerService implements ProteusBrokerService, Dispos
       int missedAcks,
       long accessKey,
       ByteBuf accessToken,
+      Tags tags,
       Tracer tracer) {
     Objects.requireNonNull(seedAddresses);
     if (seedAddresses.isEmpty()) {
@@ -98,8 +94,6 @@ public class DefaultProteusBrokerService implements ProteusBrokerService, Dispos
 
     this.seedAddresses = seedAddresses;
     this.requestHandlingRSocket = new UnwrappingRSocket(requestHandlingRSocket);
-    this.group = group;
-    this.destinationNameFactory = destinationNameFactory;
     this.members = new ArrayList<>();
     this.suppliers = new ArrayList<>();
     this.clientTransportFactory = clientTransportFactory;
@@ -110,6 +104,7 @@ public class DefaultProteusBrokerService implements ProteusBrokerService, Dispos
     this.missedAcks = missedAcks;
     this.accessKey = accessKey;
     this.accessToken = accessToken;
+    this.tags = tags;
     this.onClose = MonoProcessor.create();
     this.tracer = tracer;
 
@@ -117,8 +112,8 @@ public class DefaultProteusBrokerService implements ProteusBrokerService, Dispos
 
     createFirstConnection();
 
-    this.client = new BrokerInfoServiceClient(unwrappedGroup("com.netifi.proteus.brokerServices"));
-    this.presenceNotifier = new BrokerInfoPresenceNotifier(client);
+    this.client =
+        new BrokerInfoServiceClient(unicast(Tags.of("group", "com.netifi.proteus.brokerServices")));
 
     Disposable disposable =
         client
@@ -169,29 +164,15 @@ public class DefaultProteusBrokerService implements ProteusBrokerService, Dispos
         .subscribe();
   }
 
-  static Payload getSetupPayload(
-      ByteBufAllocator alloc,
-      String computedFromDestination,
-      String group,
-      long accessKey,
-      ByteBuf accessToken) {
+  Payload setupPayloadSupplier() {
     ByteBuf metadata = null;
     try {
       metadata =
-          DestinationSetupFlyweight.encode(
-              alloc, computedFromDestination, group, accessKey, accessToken);
+          DestinationSetupFlyweight.encode(ByteBufAllocator.DEFAULT, accessKey, accessToken, tags);
       return DefaultPayload.create(Unpooled.EMPTY_BUFFER, metadata);
     } finally {
       ReferenceCountUtil.safeRelease(metadata);
     }
-  }
-
-  BrokerInfoServiceClient getBrokerInfoServiceClient() {
-    return client;
-  }
-
-  PresenceNotifier getBrokerInfoPresenceNotifier() {
-    return presenceNotifier;
   }
 
   void seedClientTransportSupplier() {
@@ -268,8 +249,7 @@ public class DefaultProteusBrokerService implements ProteusBrokerService, Dispos
   WeightedReconnectingRSocket createWeightedReconnectingRSocket() {
     return WeightedReconnectingRSocket.newInstance(
         requestHandlingRSocket,
-        destinationNameFactory,
-        this::getSetupPayload,
+        this::setupPayloadSupplier,
         this::isDisposed,
         this::selectClientTransportSupplier,
         keepalive,
@@ -283,62 +263,13 @@ public class DefaultProteusBrokerService implements ProteusBrokerService, Dispos
         inactivityFactor);
   }
 
-  Payload getSetupPayload(String computedFromDestination) {
-    return getSetupPayload(
-        ByteBufAllocator.DEFAULT, computedFromDestination, group, accessKey, accessToken);
-  }
-
-  private ProteusSocket unwrappedDestination(String destination, String group) {
+  @Override
+  public ProteusSocket unicast(Tags tags) {
     return new DefaultProteusSocket(
         payload -> {
           ByteBuf data = payload.sliceData().retain();
-          ByteBuf metadataToWrap = payload.sliceMetadata();
           ByteBuf metadata =
-              DestinationFlyweight.encode(
-                  ByteBufAllocator.DEFAULT,
-                  DefaultProteusBrokerService.this.destinationNameFactory.peek(),
-                  DefaultProteusBrokerService.this.group,
-                  destination,
-                  group,
-                  metadataToWrap);
-          Payload wrappedPayload = ByteBufPayload.create(data, metadata);
-          payload.release();
-          return wrappedPayload;
-        },
-        this::selectRSocket);
-  }
-
-  private ProteusSocket unwrappedGroup(String group) {
-    return new DefaultProteusSocket(
-        payload -> {
-          ByteBuf data = payload.sliceData().retain();
-          ByteBuf metadataToWrap = payload.sliceMetadata();
-          ByteBuf metadata =
-              GroupFlyweight.encode(
-                  ByteBufAllocator.DEFAULT,
-                  DefaultProteusBrokerService.this.destinationNameFactory.peek(),
-                  DefaultProteusBrokerService.this.group,
-                  group,
-                  metadataToWrap);
-          Payload wrappedPayload = ByteBufPayload.create(data, metadata);
-          payload.release();
-          return wrappedPayload;
-        },
-        this::selectRSocket);
-  }
-
-  private ProteusSocket unwrappedBroadcast(String group) {
-    return new DefaultProteusSocket(
-        payload -> {
-          ByteBuf data = payload.sliceData().retain();
-          ByteBuf metadataToWrap = payload.sliceMetadata();
-          ByteBuf metadata =
-              BroadcastFlyweight.encode(
-                  ByteBufAllocator.DEFAULT,
-                  DefaultProteusBrokerService.this.destinationNameFactory.peek(),
-                  DefaultProteusBrokerService.this.group,
-                  group,
-                  metadataToWrap);
+              UnicastFlyweight.encode(ByteBufAllocator.DEFAULT, payload.sliceMetadata(), tags);
           Payload wrappedPayload = ByteBufPayload.create(data, metadata);
           payload.release();
           return wrappedPayload;
@@ -347,19 +278,32 @@ public class DefaultProteusBrokerService implements ProteusBrokerService, Dispos
   }
 
   @Override
-  public ProteusSocket destination(String destination, String group) {
-    return PresenceAwareRSocket.wrap(
-        unwrappedDestination(destination, group), destination, group, presenceNotifier);
+  public ProteusSocket broadcast(Tags tags) {
+    return new DefaultProteusSocket(
+        payload -> {
+          ByteBuf data = payload.sliceData().retain();
+          ByteBuf metadata =
+              BroadcastFlyweight.encode(ByteBufAllocator.DEFAULT, payload.sliceMetadata(), tags);
+          Payload wrappedPayload = ByteBufPayload.create(data, metadata);
+          payload.release();
+          return wrappedPayload;
+        },
+        this::selectRSocket);
   }
 
   @Override
-  public ProteusSocket group(String group) {
-    return PresenceAwareRSocket.wrap(unwrappedGroup(group), null, group, presenceNotifier);
-  }
-
-  @Override
-  public ProteusSocket broadcast(String group) {
-    return PresenceAwareRSocket.wrap(unwrappedBroadcast(group), null, group, presenceNotifier);
+  public ProteusSocket shard(ByteBuf shardKey, Tags tags) {
+    return new DefaultProteusSocket(
+        payload -> {
+          ByteBuf data = payload.sliceData().retain();
+          ByteBuf metadata =
+              ShardFlyweight.encode(
+                  ByteBufAllocator.DEFAULT, shardKey, payload.sliceMetadata(), tags);
+          Payload wrappedPayload = ByteBufPayload.create(data, metadata);
+          payload.release();
+          return wrappedPayload;
+        },
+        this::selectRSocket);
   }
 
   @Override
